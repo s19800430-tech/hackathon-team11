@@ -3698,6 +3698,17 @@ const ROLE_BY_DOCTYPE = { contract: "contract", attachment: "attachment", agreem
 const STATUS_TEXT = { current: "現行", old: "舊版", unknown: "待確認" };
 const EDITION_TEXT = { branch: "分公司版", hq: "總公司版", single: "只有一版" };
 
+// 列印與清單的固定順序（使用者 2026-11-26 問順序對不對：原本依加入清單的先後）：
+// 主約 → 契約附件 → 賠補償等附件 → 有編號的協議書依編號 (7)(12)(44) → 沒編號的依名稱
+const DOC_ORDER_GROUP = { contract: 1, attachment: 2, agreement: 3 };
+function agreementNumber(name) { const m = String(name).match(/^\s*[（(](\d+)[）)]/); return m ? Number(m[1]) : Infinity; }
+function printOrder(docs, nameOf = docName) {
+  const rank = d => d.role === "contract" ? 0 : (DOC_ORDER_GROUP[(DOCUMENTS[d.docKey] || {}).docType] || 3);
+  return docs.map((d, i) => ({ d, i })).sort((a, b) => rank(a.d) - rank(b.d)
+    || agreementNumber(nameOf(a.d.docKey)) - agreementNumber(nameOf(b.d.docKey))
+    || (rank(a.d) === 3 && agreementNumber(nameOf(a.d.docKey)) === Infinity ? nameOf(a.d.docKey).localeCompare(nameOf(b.d.docKey), "zh-Hant") : 0)
+    || a.i - b.i).map(x => x.d);
+}
 function docName(docKey) { return String((DOCUMENTS[docKey] || {}).displayName || docKey).replace(/（原名[^）]*）/, ""); }
 
 function versionLabel(v) {
@@ -9637,7 +9648,7 @@ function renderContractTab() {
     `<fieldset class="wq"><legend><b>客戶需求</b>（勾選後列出對應的協議書）</legend><div id="customerNeeds">${needsHtml()}</div></fieldset>`;
   renderProposals(evaluateCase(effectiveCase(current, memoryFields)));
   $("selectedDocs").innerHTML = current.selectedDocuments.length
-    ? `<div class="timescroll"><table class="fields doc-table"><tr><th>文件</th><th>版本</th><th>為什麼要附</th><th>標記</th><th></th></tr>${current.selectedDocuments.map(selectedDocRowHtml).join("")}</table></div>`
+    ? `<div class="timescroll"><table class="fields doc-table"><tr><th>文件</th><th>版本</th><th>為什麼要附</th><th>標記</th><th></th></tr>${printOrder(current.selectedDocuments).map(selectedDocRowHtml).join("")}</table></div>`
     : `<p class="hint">還沒有選定文件。</p>`;
   $("manualPick").innerHTML = manualPickHtml();
 }
@@ -10223,7 +10234,7 @@ function setPdfMetadata(pdfDoc, part, now) {
 async function buildContractPdf(eff) {
   const { pdfDoc, font, fkFont } = await newPdf("contract");
   const notes = [], actions = [], handwrite = [];   // notes：參考資訊；actions：要處理的事；handwrite：印出後要手寫的格子
-  const ordered = [...eff.selectedDocuments.filter(d => d.role === "contract"), ...eff.selectedDocuments.filter(d => d.role !== "contract")];
+  const ordered = printOrder(eff.selectedDocuments);
   for (const doc of ordered) {
     const isContract = doc.role === "contract";
     const viaContractTemplate = isContract || !!templateForVersion(doc.versionId, eff);   // 契約的附件（例如 GPS 車輛明細表）有契約底圖與座標檔，走契約這條路
