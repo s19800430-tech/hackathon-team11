@@ -697,6 +697,7 @@ section.map-full .tw-map.live { height: calc(100vh - 210px); }
   <!-- 緊急連絡人名冊（獨立選項，2026-11-23）：名冊與簽名（另一個節點，另外產生 PDF；使用者 2026-11-19） -->
   <div class="tabpage" id="tab-roster">
     <p class="issues warn roster-note">這是這件取約的第 2 份文件：契約之外，還要請客戶填緊急連絡人名冊，印出後簽名或用印；名冊沒有簽名或用印，客戶不能上線。</p>
+    <div id="rosterDemo"></div>
     <section class="card">
       <h2>一、基本資料</h2>
       <p class="hint">灰底欄位從第 1 步帶入；主機編號要另外填。</p>
@@ -2000,6 +2001,8 @@ const SMS = [
 const HACKATHON_KEEP_PRIVATE = true;
 // 黑客松示範用：第 1 步逐欄確認加「全部已核對」按鈕，一鍵勾完含關鍵欄位（使用者 2026-11-25）；正式版改 false
 const HACKATHON_VERIFY_ALL = true;
+// 黑客松示範用：名冊一鍵填入虛構連絡人、時間與選項（使用者 2026-11-26）；正式版改 false
+const HACKATHON_DEMO_ROSTER = true;
 const ROSTER_FROM_FIELDS = [
   ["orderNo", "案件短碼（不會印出）"],
   ["sitePhone", "標的物電話"],
@@ -2467,6 +2470,25 @@ function emptyRoster() {
     times: Object.fromEntries(DAYS.map(([k]) => [k, { set: "", unset: "" }])),
     remind: "", remindSub: "", sms: "", smsTargets: [],
     signerName: "", signerRole: "", signature: "", signedAt: "", signedHash: "",
+  };
+}
+
+// 黑客松示範用：名冊一鍵填好（使用者 2026-11-26「不用一個一個輸入」）。名字、電話全虛構；
+// 回傳要併進 roster 的欄位，不動簽名紀錄。簽名人：有契約負責人就是負責人，沒有就是第一位連絡人（最高主管）
+const DEMO_ROSTER_CONTACTS = [
+  { name: "林雅婷", title: "店長", birthday: "1985-03-14", phone: "0911-203-415", email: "yating.lin@example.com" },
+  { name: "陳冠宇", title: "副店長", birthday: "1990-08-02", phone: "0928-517-306", email: "guanyu.chen@example.com" },
+  { name: "黃淑芬", title: "會計", birthday: "1978-11-21", phone: "0935-640-182", email: "" },
+];
+function quickDemoRoster(view) {
+  const contacts = DEMO_ROSTER_CONTACTS.map((c, i) => ({ ...emptyContact(), ...c, card: String(i + 1).padStart(3, "0") }));
+  const weekday = { set: "22:00", unset: "07:30" }, weekend = { set: "18:00", unset: "09:00" };
+  const times = Object.fromEntries(DAYS.map(([k]) => [k, { ...(["sat", "sun", "hol"].includes(k) ? weekend : weekday) }]));
+  const owner = view.ownerName || "";
+  return {
+    hostNo: view.hostNo || "A0815", siteExt: view.siteExt || "", contacts, times,
+    remind: "check", remindSub: "voice", sms: "yes", smsTargets: [0, 1],
+    signerName: owner || contacts[0].name, signerRole: owner ? "owner" : "topContact",
   };
 }
 
@@ -9894,7 +9916,20 @@ function fillRosterInputs() {
   rosterRoot().querySelectorAll("[data-r]").forEach(el => { el.value = current.roster[el.dataset.r] || ""; });
 }
 
+function renderRosterDemo() {
+  const el = $("rosterDemo"); if (!el) return;
+  el.innerHTML = HACKATHON_DEMO_ROSTER
+    ? `<p><button class="small" id="rosterDemoBtn" onclick="onDemoRoster()">一鍵填入名冊</button> <span class="badge demo-tag dev-note">黑客松示範用</span></p>` : "";
+}
+
+// 黑客松示範用：連絡人、服務時間、提醒與簡訊、簽名人一次填好，填完照常跑名冊檢查
+function onDemoRoster() {
+  readRosterForm();
+  updateRoster(quickDemoRoster(currentRosterView()));
+}
+
 function renderRoster() {
+  renderRosterDemo();
   renderRosterDerived();
   fillRosterInputs();
   renderContacts(); renderTimes(); renderRemind(); renderSms(); renderRosterIssues(); drawSavedSignature();
