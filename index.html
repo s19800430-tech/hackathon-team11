@@ -383,6 +383,16 @@ label.radio { min-height: var(--tap); }
 #customerNeeds .multi-tag { margin: 8px 0 2px; font-size: .85em; }
 .doc-table td { vertical-align: top; }
 .doc-table td .badge { margin: 0 4px 4px 0; }
+/* 窄螢幕（iPad 直向以下）：選定的文件改成一份一張卡片，不擠成直條（使用者 2026-11-26 截圖） */
+@media (max-width: 900px) {
+  .doc-table, .doc-table tbody, .doc-table tr, .doc-table td { display: block; width: 100%; box-sizing: border-box; }
+  .doc-table tr:first-child { display: none; }
+  .doc-table tr { border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; }
+  table.fields.doc-table td { border: none; padding: 4px 0; width: 100%; white-space: normal; }
+  .doc-table td[data-label]:not([data-label="文件"]):not([data-label="版本"])::before { content: attr(data-label) "："; color: var(--muted); font-size: .85em; display: block; }
+  .doc-table td select { width: 100%; }
+  .doc-table td.doc-act:empty { display: none; }
+}
 #customerNeeds .need-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); align-items: end; gap: 10px 16px; margin: 10px 0 4px; padding: 12px; border-left: 3px solid var(--accent, #e8774a); background: var(--panel); border-radius: 6px; }
 #customerNeeds .need-field { color: var(--ink); }
 /* 暫存後的提示：離開或繼續編輯 */
@@ -2306,6 +2316,7 @@ function isoNow(now = new Date()) {
  * 分檔版（build --real-template-files）：網頁不內嵌契約與協議書原檔，放在同資料夾的 tpl/*.pdf，
  * 產生 PDF 時才用相對網址 fetch 需要的那幾份；取到後比對 SHA-256，對不上就不用。
  * 同一份檔只下載一次，快取在記憶體；下載失敗或比對不符不快取，按一次就重抓。
+ * Firebase 登入版（build --firebase）：同樣的網址與 SHA-256，但 bytes 改從 Firestore 的 chunks 組回（13_tpl-chunks.js）。
  */
 const PDF_FETCH_FAILED = "契約原檔下載失敗，請確認網路後再按一次。";
 const PDF_SHA_MISMATCH = "契約原檔和座標檔不符，不產生（避免用到不是凍結的那份底圖）。";
@@ -2316,7 +2327,7 @@ async function sha256Hex(bytes) {
 }
 
 function pdfFetchError(url, cause) {
-  const err = new Error(PDF_FETCH_FAILED);
+  const err = new Error((cause && cause.userMessage) || PDF_FETCH_FAILED);
   err.url = url;
   err.cause = cause;
   return err;
@@ -2354,7 +2365,92 @@ function createPdfFetcher(fetchFn) {
   };
 }
 
-const fetchTemplatePdf = createPdfFetcher(url => fetch(url));
+const useFirestoreTemplates = () => typeof APP_ASSETS !== "undefined" && APP_ASSETS.firebaseTemplates === true;
+const fetchTemplatePdf = createPdfFetcher(url => (useFirestoreTemplates() ? firestoreTemplateResponse(globalThis.firebaseTemplateReader, url) : fetch(url)));
+
+/* ---- 13_tpl-chunks.js ---- */
+/* ========== Firebase 登入版：底圖 PDF 從 Firestore 的 chunks 組回 ==========
+ * build --firebase：網頁不內嵌底圖，也不放 tpl/*.pdf；底圖存在 Firestore：
+ *   templates/{key}            → { sha256, chunkCount, size }
+ *   templates/{key}/chunks/{n} → { b64 }（每段原始 bytes 最多 TEMPLATE_CHUNK_BYTES，base64 後 < 700 KB）
+ * key ＝分檔版的安全檔名去掉 .pdf（tools/firebase_upload_templates.py 用同一份清單上傳）。
+ * 讀 Firestore 的函式由 firebase/web/auth-gate.js 登入後掛在 globalThis.firebaseTemplateReader；
+ * 這裡只負責把讀到的 chunks 組回 bytes，交給 13_pdf-fetch.js 的 createPdfFetcher 比對 SHA-256 與快取。
+ */
+const TEMPLATE_CHUNK_BYTES = 512 * 1024;   // 與 tools/firebase_upload_templates.py 的 CHUNK_BYTES 一致（單元測試比對）
+const TEMPLATE_MAX_CHUNKS = 64;
+const TPL_URL_PREFIX = "tpl/";
+const TPL_NOT_SIGNED_IN = "還沒登入，拿不到契約原檔。請重新整理頁面並用 Google 帳號登入。";
+const TPL_DENIED = "你的存取已被移除或登入已過期，拿不到契約原檔。請重新登入；仍不行請聯絡負責人。";
+const TPL_INCOMPLETE = "雲端的契約原檔不完整，請聯絡負責人重新上傳。";
+
+function templateKeyFromUrl(url) {
+  const s = String(url || "");
+  if (!s.startsWith(TPL_URL_PREFIX) || !s.endsWith(".pdf")) throw tplError(TPL_INCOMPLETE, `不是底圖網址：${s}`);
+  return s.slice(TPL_URL_PREFIX.length, -".pdf".length);
+}
+
+// 帶 userMessage 的錯誤：13_pdf-fetch.js 包裝下載失敗時會用它當畫面訊息
+function tplError(userMessage, detail, code) {
+  const err = new Error(detail || userMessage);
+  err.userMessage = userMessage;
+  if (code) err.code = code;
+  return err;
+}
+
+// Firestore 錯誤碼 → 畫面訊息（沒列的錯誤碼回 null，用一般的「下載失敗」訊息）
+function firestoreErrorMessage(code, key) {
+  if (code === "permission-denied" || code === "unauthenticated") return TPL_DENIED;
+  if (code === "not-found") return `雲端找不到這份契約原檔（${key}），請聯絡負責人上傳。`;
+  return null;
+}
+
+// 切割：上傳工具用同樣的規則（每段最多 TEMPLATE_CHUNK_BYTES，最後一段可較短；空檔 0 段）
+function splitTemplateChunks(bytes, size = TEMPLATE_CHUNK_BYTES) {
+  const out = [];
+  for (let i = 0; i < bytes.length; i += size) out.push(bytes.subarray(i, Math.min(i + size, bytes.length)));
+  return out;
+}
+
+function base64Chunk(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// meta：templates/{key} 主文件；chunks：依序第 0..chunkCount-1 段的 b64（缺的段是 null）
+function assembleTemplateChunks(meta, chunks) {
+  const count = meta && meta.chunkCount;
+  if (!Number.isInteger(count) || count < 1 || count > TEMPLATE_MAX_CHUNKS) throw tplError(TPL_INCOMPLETE, `chunkCount 不合理：${count}`);
+  if (!Array.isArray(chunks) || chunks.length !== count || chunks.some(c => typeof c !== "string" || !c)) throw tplError(TPL_INCOMPLETE, "缺 chunk");
+  let parts;
+  try {
+    parts = chunks.map(base64Chunk);
+  } catch (e) {
+    throw tplError(TPL_INCOMPLETE, `chunk 不是 base64：${e.message}`);
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  if (Number.isInteger(meta.size) && meta.size !== total) throw tplError(TPL_INCOMPLETE, `大小不符：${total} ≠ ${meta.size}`);
+  const out = new Uint8Array(total);
+  parts.reduce((offset, p) => { out.set(p, offset); return offset + p.length; }, 0);
+  return out;
+}
+
+// 給 createPdfFetcher 用的 fetchFn：回傳像 Response 的物件，SHA-256 比對與快取仍在 13_pdf-fetch.js
+async function firestoreTemplateResponse(readTemplate, url) {
+  const key = templateKeyFromUrl(url);
+  if (typeof readTemplate !== "function") throw tplError(TPL_NOT_SIGNED_IN, "firebaseTemplateReader 尚未掛上");
+  let got;
+  try {
+    got = await readTemplate(key);
+  } catch (e) {
+    const msg = firestoreErrorMessage(e && e.code, key);
+    throw msg ? tplError(msg, e && e.message, e.code) : e;
+  }
+  const bytes = assembleTemplateChunks(got && got.meta, got && got.chunks);
+  return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+}
 
 /* ---- 14_case-model.js ---- */
 /* ========== 案件模型（純函式；格式依 架構/schema/case.schema.json 1.1.0、名冊整合介面.md） ========== */
@@ -3403,6 +3499,8 @@ function aedModelItems(c) {
 // 契約年限少於 36 個月：提醒要附縮短服務期間協議書。版本有分公司、總公司、租賃、公營等多種，不自動選（新保作業流程專家 2026-11-23；待確認）
 function shortenTermItems(c) {
   if (derivedAnswer(c, "shortenTerm") !== true || !c.selectedDocuments.some(d => d.role === "contract")) return [];
+  // 協議書語言選英文時已自動附英文版 (5)，不用再提醒
+  if ((REQUIRED_DOC_EQUIVALENTS["AG-05"] || []).some(k => c.selectedDocuments.some(d => d.docKey === k))) return [];
   return [ruleItem("SYS-SHORTEN-AGREEMENT", "warning", "SAP 的契約年限少於 36 個月：要附縮短服務期間協議書。版本有好幾種，請在下方「客戶需求」或手動加選，並請法務室確認（待確認）。", true, { path: "fields.contractTermMonths" })];
 }
 
@@ -3412,7 +3510,8 @@ function builtinItems(c, versions, documents, required) {
   c.selectedDocuments.filter(d => !versions[d.versionId]).forEach(d =>
     items.push(ruleItem("SYS-VERSION-UNKNOWN", "error", `版本表裡找不到 ${d.versionId}。`, false, { versionId: d.versionId })));
   const selectedKeys = new Set(c.selectedDocuments.map(d => d.docKey));
-  required.filter(r => !selectedKeys.has(r.outcome.docKey)).forEach(r => items.push(ruleItem("SYS-REQUIRED-DOC", "error",
+  // 外文版可以取代中文版必附（39_needs_lang.js REQUIRED_DOC_EQUIVALENTS）
+  required.filter(r => !requiredDocSatisfied(r.outcome.docKey, selectedKeys)).forEach(r => items.push(ruleItem("SYS-REQUIRED-DOC", "error",
     `要附「${(documents[r.outcome.docKey] || {}).displayName || r.outcome.docKey}」：${r.message}`, r.status === "draft", { path: r.ruleId })));
   requiredFieldKeys(c, versions).filter(k => { const f = c.fields[k]; return !f || f.state === "missing" || f.value === ""; })
     .forEach(k => items.push(ruleItem("SYS-REQUIRED-FIELD", "error", `「${fieldLabel(k)}」尚未填寫。`, false, { path: "fields." + k })));
@@ -3687,7 +3786,10 @@ function removeDocument(c, docKey) {
 }
 
 // 必附文件跟著目前的選擇走：該附的補上（required=true），不再需要的自動附件拿掉；使用者自己加的不動
-function syncRequiredDocuments(c, required) {
+function syncRequiredDocuments(c, allRequired) {
+  // 已由外文版取代的中文版必附不再自動附（39_needs_lang.js）
+  const replaced = replacedDocKeys(c, NEEDS_TABLE);
+  const required = allRequired.filter(r => !replaced.has(r.docKey));
   const neededKeys = new Set(required.map(r => r.docKey));
   const kept = c.selectedDocuments.filter(d => !d.required || neededKeys.has(d.docKey))
     .map(d => neededKeys.has(d.docKey) && !d.required ? { ...d, required: true } : d);
@@ -6364,11 +6466,15 @@ function agreementsForNeeds(c, needsTable, versionsDoc) {
     if (!holds(n.when, ctx, null)) return [noMatch([n.needId], "這件的資料不符合需求的條件", n.sourceRef)];
     return needEntries(n, c, versionsDoc);
   });
-  return mergeByDoc(entries);
+  // 取代中文版必附的外文版（39_needs_lang.js）：對照表寫選附，這裡改成必附
+  const substitutes = substituteRequiredDocKeys(c, needsTable);
+  return mergeByDoc(entries.map(e => e.docKey && substitutes.has(e.docKey) ? { ...e, attach: "required" } : e));
 }
 
 /* ---------- 併進 selectedDocuments：同一份不重複；精靈與需求的版本不同時，保留精靈的並記成衝突 ---------- */
-const isNeedReason = id => id.startsWith(NEED_ID_PREFIX);
+// 需求帶進來的來源：NEED- 開頭，或對照表的需求代碼（A-045、B-124…，syncNeedDocuments 直接記需求代碼）
+const NEED_IDS = new Set((NEEDS_TABLE.needs || []).map(n => n.needId));
+const isNeedReason = id => id.startsWith(NEED_ID_PREFIX) || NEED_IDS.has(id);
 
 // 必附的協議書自動加進文件清單；選附與待確認的只列出，由業務按「加入文件清單」
 function syncNeedDocuments(c, results) {
@@ -6376,8 +6482,9 @@ function syncNeedDocuments(c, results) {
   const wantedKeys = new Set(wanted.map(r => r.docKey));
   const conflicts = [];
   // 只由需求帶進來、現在不再需要的：移除
-  const kept = c.selectedDocuments.filter(d => !(d.reasonRuleIds.length && d.reasonRuleIds.every(isNeedReason) && !wantedKeys.has(d.docKey)))
-    .map(d => ({ ...d, reasonRuleIds: d.reasonRuleIds.filter(id => !isNeedReason(id) || wantedKeys.has(d.docKey)) }));
+  // 業務按「加入文件清單」自己加的（userOverride）不動
+  const kept = c.selectedDocuments.filter(d => d.userOverride || !(d.reasonRuleIds.length && d.reasonRuleIds.every(isNeedReason) && !wantedKeys.has(d.docKey)))
+    .map(d => d.userOverride ? d : ({ ...d, reasonRuleIds: d.reasonRuleIds.filter(id => !isNeedReason(id) || wantedKeys.has(d.docKey)) }));
   const keptByKey = new Map(kept.map(d => [d.docKey, d]));
   wanted.forEach(r => {
     const existing = keptByKey.get(r.docKey);
@@ -6454,6 +6561,113 @@ function toggleNeed(chosen, needId, checked) {
   const drop = new Set([...(group ? NEED_BLOCKS[group.id] || [] : []), ...blockerIdsOf(needId),
     ...(lang ? others.filter(id => languageOfNeed(id) && languageOfNeed(id) !== lang) : [])]);
   return [...others.filter(id => !drop.has(id)), needId];
+}
+
+/* ---- 39_needs_lang.js ---- */
+/* ========== 協議書語言（使用者 2026-11-26：「沒有地方選英文中文版」）；純函式 ==========
+ * 存在 wizardAnswers.agreementLanguage："zh"（預設）、"en"、"ja"。不放進 catalog 題目（catalog 的題目會出現在精靈），
+ * 由第 2 步「客戶需求」最上面直接問。
+ * - 需求清單依語言過濾（needsForLanguage）：中文不列外文版；英文有英文版的中文需求只列英文版；日文只多列日文版。
+ * - 換語言時已勾的需求跟著換（switchNeedLanguage）。
+ * - SAP 帶出的中文協議書改用外文版（LANGUAGE_SUBSTITUTES）：送出前檢查認得外文版可以取代中文版必附（requiredDocSatisfied）。
+ */
+const AGREEMENT_LANGUAGES = [
+  { code: "zh", label: "中文（預設）", name: "中文" },
+  { code: "en", label: "英文（外籍客戶）", name: "英文" },
+  { code: "ja", label: "日文（日籍客戶）", name: "日文" },
+];
+const DEFAULT_AGREEMENT_LANGUAGE = "zh";
+const LANGUAGE_CODE_BY_NAME = { 英文: "en", 日文: "ja" };   // NEED_LANGUAGE（39_needs.js）用中文名稱
+const languageName = code => (AGREEMENT_LANGUAGES.find(l => l.code === code) || AGREEMENT_LANGUAGES[0]).name;
+const needLanguageCode = id => LANGUAGE_CODE_BY_NAME[languageOfNeed(id)] || DEFAULT_AGREEMENT_LANGUAGE;
+const agreementLanguageOf = c => {
+  const v = ((c && c.wizardAnswers) || {}).agreementLanguage;
+  return AGREEMENT_LANGUAGES.some(l => l.code === v) ? v : DEFAULT_AGREEMENT_LANGUAGE;
+};
+
+// 中文需求 → 同一份協議書的外文版需求（擇一群組 cctvAdd、cctvEquip、leaseShorten 的成員）
+const NEED_TRANSLATIONS = {
+  en: { "A-045": "B-122", "B-025": "B-123", "B-007": "B-120" },
+  ja: {},
+};
+const TRANSLATED_FROM = Object.fromEntries(Object.values(NEED_TRANSLATIONS).flatMap(m => Object.entries(m).map(([zh, foreign]) => [foreign, zh])));
+
+// SAP 帶出的中文協議書，外文版要整份換掉：英文縮短服務期間、日文年繳 12 優 1
+// replacesName 寫死：畫面上 docName("AG-05") 只拿得到代碼，業務看不懂
+const LANGUAGE_SUBSTITUTES = [
+  { needId: "B-119", lang: "en", docKey: "AG-EN-SHORTEN", replaces: "AG-05", replacesName: "(5) 縮短服務期間協議書", why: "SAP 契約年限少於 36 個月",
+    when: c => derivedAnswer(c, "shortenTerm") === true },
+  { needId: "B-124", lang: "ja", docKey: "AG-JP-ANNUAL", replaces: "AG-07", replacesName: "(7) 年繳優待第 13 個月協議書", why: "SAP 優待方式 12優1",
+    when: c => fieldValue(c.fields, "discountMethod") === "12優1" },
+];
+// 必附等價：中文版 docKey → 可以取代它的外文版 docKey
+const REQUIRED_DOC_EQUIVALENTS = Object.fromEntries(LANGUAGE_SUBSTITUTES.map(s => [s.replaces, [s.docKey]]));
+
+// 必附的文件在清單裡，或清單裡有可以取代它的外文版
+function requiredDocSatisfied(docKey, selectedKeys) {
+  return selectedKeys.has(docKey) || (REQUIRED_DOC_EQUIVALENTS[docKey] || []).some(k => selectedKeys.has(k));
+}
+
+// 依語言過濾要列出的需求（needs：已依主約篩過的需求物件）
+function needsForLanguage(needs, lang) {
+  const ids = new Set(needs.map(n => n.needId));
+  const translations = NEED_TRANSLATIONS[lang] || {};
+  return needs.filter(n => {
+    const own = needLanguageCode(n.needId);
+    if (own !== DEFAULT_AGREEMENT_LANGUAGE) return own === lang;
+    return !(translations[n.needId] && ids.has(translations[n.needId]));
+  });
+}
+
+// 換語言：已勾的需求換成新語言的對應版；沒有對應的中文需求照舊；別種語言、沒有中文對應的外文版拿掉
+function switchNeedLanguage(chosen, from, to) {
+  if (from === to) return [...chosen];
+  const toTarget = NEED_TRANSLATIONS[to] || {};
+  const mapped = chosen.flatMap(id => {
+    const own = needLanguageCode(id);
+    if (own === to) return [id];
+    const zh = own === DEFAULT_AGREEMENT_LANGUAGE ? id : TRANSLATED_FROM[id];
+    if (!zh) return [];
+    return [toTarget[zh] || zh];
+  });
+  return [...new Set(mapped)];
+}
+
+// 這件適用的外文版替代（語言相符、SAP 條件成立、主約適用）
+function activeSubstitutes(c, needsTable) {
+  const lang = agreementLanguageOf(c);
+  const contract = selectedContract(c);
+  const byId = new Map((needsTable.needs || []).map(n => [n.needId, n]));
+  return LANGUAGE_SUBSTITUTES.filter(s => s.lang === lang && s.when(c) && byId.has(s.needId) && needApplies(byId.get(s.needId), contract));
+}
+
+// 需求跟著語言走：別種語言的外文版拿掉，SAP 帶出的外文版自動勾上（c 要是 effectiveCase，才讀得到補填欄位）
+function syncLanguageNeeds(c, needsTable) {
+  const lang = agreementLanguageOf(c);
+  const chosen = c.customerNeeds || [];
+  const kept = chosen.filter(id => [DEFAULT_AGREEMENT_LANGUAGE, lang].includes(needLanguageCode(id)));
+  const auto = activeSubstitutes(c, needsTable).map(s => s.needId).filter(id => !kept.includes(id));
+  const next = [...kept, ...auto];
+  return next.length === chosen.length && next.every((id, i) => id === chosen[i]) ? c : { ...c, customerNeeds: next };
+}
+
+// 被外文版取代、不用再自動附的中文版必附 docKey
+function replacedDocKeys(c, needsTable) {
+  const chosen = new Set(c.customerNeeds || []);
+  return new Set(activeSubstitutes(c, needsTable).filter(s => chosen.has(s.needId)).map(s => s.replaces));
+}
+
+// 外文版替代的協議書一律必附（對照表寫選附，但它取代的是中文版必附）
+function substituteRequiredDocKeys(c, needsTable) {
+  return new Set(activeSubstitutes(c, needsTable).map(s => s.docKey));
+}
+
+// 第 2 步「選定的文件」的為什麼要附
+function languageReasonText(docKey, needIds) {
+  const sub = LANGUAGE_SUBSTITUTES.find(s => s.docKey === docKey);
+  if (sub) return `協議書語言：${languageName(sub.lang)}（${sub.why}，取代中文版「${sub.replacesName}」）`;
+  const foreign = needIds.map(needLanguageCode).find(code => code !== DEFAULT_AGREEMENT_LANGUAGE);
+  return foreign ? `協議書語言：${languageName(foreign)}` : "";
 }
 
 /* ---- 40_ui-shell.js ---- */
@@ -6546,7 +6760,9 @@ let droppedNeedsNotice = null;
 function commitWithSync(rawNext, nextMemory = memoryFields) {
   const before = selectedContract(current || { selectedDocuments: [] });
   const pruned = pruneNeedsForContract(rawNext, NEEDS_TABLE);
-  const next = pruned.case;
+  // 協議書語言：別種語言的外文版拿掉、SAP 帶出的外文版自動勾（要用補填後的欄位判斷）
+  const langEff = effectiveCase(pruned.case, nextMemory), langSynced = syncLanguageNeeds(langEff, NEEDS_TABLE);
+  const next = langSynced === langEff ? pruned.case : { ...pruned.case, customerNeeds: langSynced.customerNeeds };
   const after = selectedContract(next);
   if (pruned.dropped.length) droppedNeedsNotice = { labels: pruned.dropped.map(needLabel), contract: after ? docName(after.docKey) : "", changed: !before || !after || before.docKey !== after.docKey };
   const ev = evaluateCase(effectiveCase(next, nextMemory));
@@ -9230,13 +9446,18 @@ function docReasonText(d) {
   if (d.role === "contract") return d.userOverride ? "手動選的主約" : "第 2 步選主約的答案";
   const sap = d.reasonRuleIds.map(id => SAP_DERIVED_RULES[id]).find(Boolean);
   if (sap) return sap;
+  // 外文版：先寫協議書語言，業務才看得懂為什麼是英文、日文（使用者 2026-11-26）
+  const needIds = d.reasonRuleIds.map(id => id.startsWith(NEED_ID_PREFIX) ? id.slice(NEED_ID_PREFIX.length) : id);
+  const lang = languageReasonText(d.docKey, needIds);
+  if (LANGUAGE_SUBSTITUTES.some(x => x.docKey === d.docKey) && lang) return lang;
   const why = d.reasonRuleIds.map(id => {
     const needId = id.startsWith(NEED_ID_PREFIX) ? id.slice(NEED_ID_PREFIX.length) : id;
     const need = (NEEDS_TABLE.needs || []).find(n => n.needId === needId);
     if (need) { const g = NEED_EXCLUSIVE.find(x => x.needIds.includes(needId)); return `客戶需求：${g ? (g.short || {})[needId] || need.label : need.label}`; }
     return RULE_BY_ID[id] ? RULE_BY_ID[id].message.replace(/[：:].*$/, "") : "";
   }).filter(Boolean);
-  return why.length ? [...new Set(why)].join("；") : (d.userOverride ? "手動加選" : "");
+  const text = why.length ? [...new Set(why)].join("；") : (d.userOverride ? "手動加選" : "");
+  return lang ? `${lang}；${text}` : text;
 }
 function selectedDocRowHtml(d) {
   const roleText = { contract: "契約", attachment: "附件", agreement: "協議書" }[d.role];
@@ -9247,14 +9468,14 @@ function selectedDocRowHtml(d) {
   const needRequired = d.reasonRuleIds.some(id => {
     const need = (NEEDS_TABLE.needs || []).find(n => n.needId === (id.startsWith(NEED_ID_PREFIX) ? id.slice(NEED_ID_PREFIX.length) : id));
     return need && need.agreements.some(a => a.docKey === d.docKey && (a.attach || "required") === "required");
-  });
+  }) || substituteRequiredDocKeys(effectiveCase(current, memoryFields), NEEDS_TABLE).has(d.docKey);
   const kind = d.role === "contract" ? '<span class="badge">主約</span>' : d.required || needRequired ? '<span class="badge draft">必附</span>' : '<span class="badge">選附</span>';
   const tags = [kind,
     v.status === "unknown" ? '<span class="badge draft">版本待確認</span>' : "", v.status === "old" ? '<span class="badge err">舊版</span>' : "",
     templateForVersion(d.versionId) ? "" : '<span class="badge dev-note">此契約尚無疊印範本</span>'].join("");
-  return `<tr><td><span class="hint">${roleText}</span><br><b>${esc(docName(d.docKey))}</b>${classPick}${d.role === "contract" ? `<div class="hint">${esc(partyBText(d.docKey))}</div>` : ""}</td>
-    <td>${versionPickHtml(d)}</td><td>${esc(docReasonText(d))}</td><td>${tags}</td>
-    <td>${d.required || d.role === "contract" ? "" : `<button class="small danger" data-key="${esc(d.docKey)}" onclick="onRemoveDoc(this.dataset.key)">移除</button>`}</td></tr>`;
+  return `<tr><td data-label="文件"><span class="hint">${roleText}</span><br><b>${esc(docName(d.docKey))}</b>${classPick}${d.role === "contract" ? `<div class="hint">${esc(partyBText(d.docKey))}</div>` : ""}</td>
+    <td data-label="版本">${versionPickHtml(d)}</td><td data-label="為什麼要附">${esc(docReasonText(d))}</td><td data-label="標記">${tags}</td>
+    <td class="doc-act">${d.required || d.role === "contract" ? "" : `<button class="small danger" data-key="${esc(d.docKey)}" onclick="onRemoveDoc(this.dataset.key)">移除</button>`}</td></tr>`;
 }
 
 function manualPickHtml() {
@@ -9315,6 +9536,31 @@ function onNeedCatToggle(el) {
   openNeedCats = next;
 }
 
+/* ---------- 協議書語言（39_needs_lang.js）：選定主約的需求裡有外文版才問 ---------- */
+function onAgreementLanguage(code) {
+  const from = agreementLanguageOf(current);
+  if (code === from || !AGREEMENT_LANGUAGES.some(l => l.code === code)) return;
+  commitWithSync({ ...current, wizardAnswers: { ...current.wizardAnswers, agreementLanguage: code },
+    customerNeeds: switchNeedLanguage(current.customerNeeds || [], from, code) });
+}
+function languageHtml(applicableIds) {
+  const lang = agreementLanguageOf(current);
+  if (lang === DEFAULT_AGREEMENT_LANGUAGE && ![...applicableIds].some(languageOfNeed)) return "";
+  const radios = AGREEMENT_LANGUAGES.map(l => `<label><input type="radio" name="agreementLanguage" value="${esc(l.code)}" ${l.code === lang ? "checked" : ""}
+    onchange="onAgreementLanguage(this.value)">${esc(l.label)}</label>`).join("");
+  const name = languageName(lang);
+  const hint = lang === DEFAULT_AGREEMENT_LANGUAGE ? "" : `<p class="hint" id="agreementLanguageHint">有${esc(name)}版的協議書會改用${esc(name)}版；沒有${esc(name)}版的照用中文版。</p>`;
+  return `<fieldset class="need-one" id="agreementLanguage"><legend>協議書語言<span class="hint">（擇一）</span></legend><div class="checks">${radios}</div>${hint}</fieldset>`;
+}
+
+// 外文版的說明依實際列出的項目寫（使用者 2026-11-26：只有一項卻寫英文、日文擇一）
+function foreignTitle(items) {
+  const langs = new Set(items.map(n => languageOfNeed(n.needId)));
+  if (langs.size > 1) return "外籍客戶的外文版（英文版可複選；英文、日文擇一）";
+  if (items.length > 1) return "外籍客戶的外文版（可複選）";
+  return "外籍客戶的外文版";
+}
+
 // 依 12 個需求大類分組；同一份協議書只列一次（agreementsForNeeds 已依代號合併）
 function needsHtml() {
   const all = (NEEDS_TABLE.needs || []).filter(n => n.status !== "disabled");
@@ -9328,13 +9574,16 @@ function needsHtml() {
   const picked = new Set(current.customerNeeds || []);
   const noCode = n => Boolean((n.appliesTo || {}).noContractCode);
   const applicable = new Set(applicableNeeds(NEEDS_TABLE, contract).map(n => n.needId));
-  const needs = all.filter(n => applicable.has(n.needId) || picked.has(n.needId));
+  // 協議書語言：中文不列外文版、英文有英文版的只列英文版、日文只多列日文版
+  const lang = agreementLanguageOf(current);
+  const langHtml = languageHtml(applicable);
+  const needs = needsForLanguage(all.filter(n => applicable.has(n.needId) || picked.has(n.needId)), lang);
   // 對照表沒有主約代碼的需求無法依主約篩選：收在最下面，需要時再展開
-  const unmatched = all.filter(n => noCode(n) && !picked.has(n.needId));
+  const unmatched = needsForLanguage(all.filter(n => noCode(n) && !picked.has(n.needId)), lang);
   // 需求很少的主約：對照表還在建立，請業務改用下方手動加選（2026-11-25）
   const sparseHtml = isNeedsSparse(applicable.size)
     ? `<p class="hint" id="needsSparse">這份主約的需求對照表還在建立，若客戶提到其他需求，請在下方「改選或加選文件」選協議書。</p>` : "";
-  if (!needs.length) return `${droppedHtml}${sparseHtml}<p class="hint">${esc(docName(contract.docKey))}目前沒有可以搭配的協議書需求。</p>`;
+  if (!needs.length) return `${langHtml}${droppedHtml}${sparseHtml}<p class="hint">${esc(docName(contract.docKey))}目前沒有可以搭配的協議書需求。</p>`;
   const chosen = new Set(current.customerNeeds || []);
   const groups = [...new Map(needs.map(n => [n.categoryCode || "OTHER", n.category || n.categoryCode])).entries()];
   const results = evaluateCase(effectiveCase(current, memoryFields)).needResults;
@@ -9375,9 +9624,9 @@ function needsHtml() {
     ${exclusiveHtml(code)}${needs.some(n => shownCode(n) === code && blocked(n)) ? '<p class="hint">選了不補償，提高倍數、合併補償、竊盜上限等補償金額的選項就不用選，已收起來。</p>' : ""}${(list => {
       const local = list.filter(n => !languageOfNeed(n.needId)), foreign = list.filter(n => languageOfNeed(n.needId));
       return (local.length ? `<p class="hint multi-tag">可複選</p><div class="checks">${local.map(checkHtml).join("")}</div>` : "")
-        + (foreign.length ? `<p class="hint multi-tag">外籍客戶的外文版（英文版可複選；英文、日文擇一）</p><div class="checks">${foreign.map(checkHtml).join("")}</div>` : "");
+        + (foreign.length ? `<p class="hint multi-tag">${foreignTitle(foreign)}</p><div class="checks">${foreign.map(checkHtml).join("")}</div>` : "");
     })(needs.filter(n => (n.categoryCode || "OTHER") === code && !inGroup.has(n.needId) && !blocked(n)))}</details>`;
-  return `${droppedHtml}${sparseHtml}<p class="hint">主約：<b>${esc(docName(contract.docKey))}</b>，這份主約可以搭配的客戶需求有 ${needs.length} 項（只列出這份主約適用的）。${needs.length > 1 ? "點分類展開，" : ""}勾選客戶提到的需求。<span class="badge draft dev-note">草稿：對照表未經組長確認</span></p>${groups.map(groupHtml).join("")}${unmatched.length ? `<details class="need-unmatched"><summary>▸ 沒有對應主約的需求（${unmatched.length}）</summary>
+  return `${langHtml}${droppedHtml}${sparseHtml}<p class="hint">主約：<b>${esc(docName(contract.docKey))}</b>，這份主約可以搭配的客戶需求有 ${needs.length} 項（只列出這份主約適用的）。${needs.length > 1 ? "點分類展開，" : ""}勾選客戶提到的需求。<span class="badge draft dev-note">草稿：對照表未經組長確認</span></p>${groups.map(groupHtml).join("")}${unmatched.length ? `<details class="need-unmatched"><summary>▸ 沒有對應主約的需求（${unmatched.length}）</summary>
     <p class="hint">這幾項在需求對照表裡沒有填主約代碼，無法判斷能不能搭配這份主約；確定用得到再勾。</p><div class="checks">${unmatched.map(checkHtml).join("")}</div></details>` : ""}
     ${results.length ? `<ul>${results.map(needResultHtml).join("")}</ul>` : ""}${conflictHtml ? `<div class="issues warn"><b>待規則合規確認</b><ul>${conflictHtml}</ul></div>` : ""}`;
 }
